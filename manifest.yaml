@@ -2,7 +2,7 @@ name: shop-listing-missing-fields-free
 slug: shop-listing-missing-fields-free
 display_name: 商品后台上架缺项检查
 description: 使用用户指定的商品编辑页、商家规则和浏览器环境，按规格、图文、物流、售后整理可见字段的缺项、冲突与人工补充表。不可见字段明确留空，未提供规则不虚构要求；全程默认只读，不保存、不提交、不上架，交付结果保留每条资料来源与处理边界。
-version: 1.0.1
+version: 1.0.2
 repository: "https://github.com/xxjrq/shop-listing-missing-fields-free"
 license: MIT
 icon: icon-512.png

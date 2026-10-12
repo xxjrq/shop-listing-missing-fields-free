@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -336,27 +338,49 @@ async function main() {
     const browserId = arg('--browser-id'), pageUrl = arg('--page-url');
     if (!browserId || !pageUrl) throw new Error('请提供 --browser-id 与 --page-url；本工具只打开自己的任务页面，不接管已有 tabId。');
     if (!/^https?:\/\//i.test(pageUrl)) throw new Error('商品编辑页必须是用户指定的 HTTP(S) URL。');
-    const cli = process.env.EASY_WEBBRIDGE_CLI;
-    if (!cli || !existsSync(cli)) throw new Error('请设置 EASY_WEBBRIDGE_CLI 为已安装 Easy WebBridge 的 cli/easy-webbridge.mjs。');
-    const help = spawnSync('node', [cli, '--help'], { encoding: 'utf8' });
-    if (![0, 2].includes(help.status) || !`${help.stdout}\n${help.stderr}`.includes('easy-webbridge command')) throw new Error('Easy WebBridge CLI 帮助不可用。');
+    const bridgeUrl = process.env.EASY_WEBBRIDGE_URL || 'http://127.0.0.1:17777';
+    const tokenPath = process.env.EASY_WEBBRIDGE_TOKEN_FILE || join(homedir(), '.easy-webbridge', 'bridge-token');
+    const token = (process.env.EASY_WEBBRIDGE_TOKEN || await readFile(tokenPath, 'utf8').catch(() => '')).trim();
+    if (!token) throw new Error('没有找到 EasyBR 内置 Bridge token；请先启动 EasyBR。');
     const session = `shop-listing-missing-fields-free-${randomUUID()}`;
-    const call = args => {
-      const r = spawnSync('node', [cli, ...args], { encoding: 'utf8', timeout: 30000 });
-      if (r.status !== 0) throw new Error('Easy WebBridge 命令失败；未作商品写入。');
-      const parsed = JSON.parse(r.stdout);
+    const call = async args => {
+      // The checked-in self-test uses this fixture CLI adapter. Production runs
+      // use EasyBR's built-in HTTP API below and never require the CLI.
+      if (process.env.LISTING_TEST_MODE && process.env.EASY_WEBBRIDGE_CLI && existsSync(process.env.EASY_WEBBRIDGE_CLI)) {
+        const r = spawnSync('node', [process.env.EASY_WEBBRIDGE_CLI, ...args], { encoding: 'utf8', timeout: 30000 });
+        if (r.status !== 0) throw new Error('Easy WebBridge 命令失败；未作商品写入。');
+        const fixture = JSON.parse(r.stdout);
+        if (fixture.ok !== true) throw new Error('Easy WebBridge 没有确认命令成功。');
+        return fixture.result;
+      }
+      let action, commandArgs;
+      if (args[0] === 'command') {
+        action = args[2];
+        commandArgs = JSON.parse(args[3] || '{}');
+      } else if (args[0] === 'snapshot') {
+        action = 'snapshot';
+        commandArgs = { tabId: Number(args[2]), visibility: args[4], textMode: args[6] };
+      } else throw new Error('不支持的 Easy WebBridge 操作。');
+      const response = await fetch(`${bridgeUrl}/v1/browsers/${encodeURIComponent(browserId)}/commands`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, args: commandArgs }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const parsed = await response.json();
+      if (!response.ok) throw new Error('Easy WebBridge 命令失败；未作商品写入。');
       if (parsed.ok !== true) throw new Error('Easy WebBridge 没有确认命令成功。');
       return parsed.result;
     };
     let opened = false, ownedTabConfirmed = false, tabId, originalScrollTop;
     try {
-      const nav = call(['command', browserId, 'navigate', JSON.stringify({url:pageUrl,newTab:true,session,groupTitle:'商品缺项检查'})]);
+      const nav = await call(['command', browserId, 'navigate', JSON.stringify({url:pageUrl,newTab:true,session,groupTitle:'商品缺项检查'})]);
       opened = true;
       tabId = Number(nav.tabId);
       if (!Number.isInteger(tabId)) throw new Error('导航没有返回有效标签页编号。');
       const deadline = Date.now() + 15000;
       while (true) {
-        const tabsResult = call(['command', browserId, 'list_tabs', JSON.stringify({session})]);
+        const tabsResult = await call(['command', browserId, 'list_tabs', JSON.stringify({session})]);
         const tabs = Array.isArray(tabsResult) ? tabsResult : tabsResult?.tabs;
         const tab = Array.isArray(tabs) ? tabs.find(t => Number(t.id) === tabId) : null;
         if (!tab) throw new Error('返回页面不属于本次任务标签组。');
@@ -374,11 +398,11 @@ async function main() {
       const requiredStableMs = testFastStabilization ? 0 : 900;
       const pollIntervalMs = testFastStabilization ? 10 : 300;
       while (Date.now() < stableDeadline) {
-        shot = call(['snapshot', browserId, String(tabId), '--visibility', 'visible', '--text-mode', 'page']);
+        shot = await call(['snapshot', browserId, String(tabId), '--visibility', 'visible', '--text-mode', 'page']);
         if (!shot || typeof shot !== 'object') throw new Error('快照结果无效，不能把包装 JSON 当页面证据。');
         if (shot.textTruncated || shot.truncated || shot.budgetTruncated) throw new Error('暂停：页面快照截断，请缩小检查范围后分批处理，未把未读取字段判缺项。');
         if (!Array.isArray(shot.interactive)) throw new Error('快照缺少 result.interactive；不能从包装文本或模拟 HTML 猜测控件值。');
-        const readiness = call(['command', browserId, 'evaluate', JSON.stringify({tabId, code: '({readyState:document.readyState,busy:[...document.querySelectorAll("[aria-busy=\"true\"],[role=\"progressbar\"],[data-loading=\"true\"]")].filter(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden"}).length})'})]);
+        const readiness = await call(['command', browserId, 'evaluate', JSON.stringify({tabId, code: '({readyState:document.readyState,busy:[...document.querySelectorAll("[aria-busy=\"true\"],[role=\"progressbar\"],[data-loading=\"true\"]")].filter(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden"}).length})'})]);
         if (!readiness || !['interactive','complete'].includes(readiness.readyState) || !Number.isFinite(readiness.busy)) throw new Error('页面异步状态不可读；未扫描可能尚未回填的字段。');
         const signature = JSON.stringify({text: shot.text || '', interactive: shot.interactive.map(({tag,role,text,value,visible,disabled}) => [tag,role,text,value,visible,disabled])});
         // `complete` only describes the document; product-editor SPAs can
@@ -398,7 +422,7 @@ async function main() {
       if (!shot || typeof shot !== 'object') throw new Error('快照结果无效，不能把包装 JSON 当页面证据。');
       if (typeof shot.url !== 'string' || !samePageIdentity(shot.url, pageUrl)) throw new Error('快照最终页面与用户指定的商品编辑页不一致；未读取或输出检查表。');
       const initialPageIdentity = pageIdentity(shot.url);
-      const initial = call(['command', browserId, 'evaluate', JSON.stringify({tabId, code: '({pageHeight:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0),viewportHeight:document.documentElement.clientHeight,scrollTop:window.scrollY})'})]);
+      const initial = await call(['command', browserId, 'evaluate', JSON.stringify({tabId, code: '({pageHeight:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0),viewportHeight:document.documentElement.clientHeight,scrollTop:window.scrollY})'})]);
       if (!initial || !Number.isFinite(initial.pageHeight) || !Number.isFinite(initial.viewportHeight) || initial.viewportHeight <= 0) throw new Error('页面高度信息不可读；未把未扫描区域判为缺项。');
       if (!Number.isFinite(initial.scrollTop)) throw new Error('初始滚动位置不可读；未开始页面扫描。');
       // Keep the original position until the outer cleanup.  A visibility
@@ -414,7 +438,7 @@ async function main() {
       if (positions.length > maxViewports) throw new Error(`页面过长，超过只读扫描上限 ${maxViewports} 屏；未生成不完整缺项表。`);
       const textParts = [], pairsByKey = new Map(), controlsByKey = new Map(), imagesByKey = new Map();
       const assertCurrentPage = () => {
-        const currentUrl = call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'location.href'})]);
+        const currentUrl = await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'location.href'})]);
         if (typeof currentUrl !== 'string' || !samePageIdentity(currentUrl, pageUrl) || pageIdentity(currentUrl) !== initialPageIdentity) throw new Error('扫描过程中商品编辑页身份发生变化；已停止并丢弃混合页面结果。');
       };
       const scanCode = `(() => {
@@ -468,12 +492,12 @@ async function main() {
       })()`;
       for (const y of positions) {
         assertCurrentPage();
-        const current = call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'window.scrollY'})]);
+        const current = await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'window.scrollY'})]);
         if(!Number.isFinite(current))throw new Error('当前滚动位置不可读；未将未扫描区域判缺项。');
         const delta = y - current;
-        if(delta)call(['command', browserId, 'scroll', JSON.stringify({tabId,x:0,y:delta})]);
+        if(delta)await call(['command', browserId, 'scroll', JSON.stringify({tabId,x:0,y:delta})]);
         await new Promise(resolve=>setTimeout(resolve,100));
-        const scan=call(['command',browserId,'evaluate',JSON.stringify({tabId,code:scanCode})]);
+        const scan=await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:scanCode})]);
         assertCurrentPage();
         if(!scan||typeof scan.text!=='string'||!Array.isArray(scan.pairs)||!Array.isArray(scan.controls)||!Array.isArray(scan.images))throw new Error('分屏可见内容读取失败；未将未读取字段判缺项。');
         if(scan.text)textParts.push(scan.text);
@@ -496,17 +520,17 @@ async function main() {
       page = pageFromSnapshot(shot, [...pairsByKey.values()], [...controlsByKey.values()], [...imagesByKey.values()], rules);
     } finally {
       if (opened && ownedTabConfirmed && Number.isFinite(originalScrollTop)) {
-        const current = call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'window.scrollY'})]);
+        const current = await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'window.scrollY'})]);
         if (!Number.isFinite(current)) throw new Error('扫描后滚动位置不可读；未恢复页面位置。');
         const restoreDelta = originalScrollTop - current;
-        if (restoreDelta) call(['command',browserId,'scroll',JSON.stringify({tabId,x:0,y:restoreDelta})]);
+        if (restoreDelta) await call(['command',browserId,'scroll',JSON.stringify({tabId,x:0,y:restoreDelta})]);
       }
       if (opened && ownedTabConfirmed) {
-        const latest = call(['command',browserId,'list_tabs',JSON.stringify({session})]);
+        const latest = await call(['command',browserId,'list_tabs',JSON.stringify({session})]);
         const tabs = Array.isArray(latest) ? latest : latest?.tabs;
         const ids = Array.isArray(tabs) ? tabs.map(tab=>Number(tab.id)).sort((a,b)=>a-b) : [];
         if (ids.length !== 1 || ids[0] !== tabId) throw new Error('任务标签组已包含其他页面或归属无法确认；为避免关闭用户页面，未关闭该标签组。');
-        call(['command', browserId, 'close_session', JSON.stringify({session})]);
+        await call(['command', browserId, 'close_session', JSON.stringify({session})]);
       }
     }
   }
