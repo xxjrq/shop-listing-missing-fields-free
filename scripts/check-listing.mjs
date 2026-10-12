@@ -437,7 +437,7 @@ async function main() {
       positions.sort((a,b)=>a-b);
       if (positions.length > maxViewports) throw new Error(`页面过长，超过只读扫描上限 ${maxViewports} 屏；未生成不完整缺项表。`);
       const textParts = [], pairsByKey = new Map(), controlsByKey = new Map(), imagesByKey = new Map();
-      const assertCurrentPage = () => {
+      const assertCurrentPage = async () => {
         const currentUrl = await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'location.href'})]);
         if (typeof currentUrl !== 'string' || !samePageIdentity(currentUrl, pageUrl) || pageIdentity(currentUrl) !== initialPageIdentity) throw new Error('扫描过程中商品编辑页身份发生变化；已停止并丢弃混合页面结果。');
       };
@@ -491,14 +491,14 @@ async function main() {
         return {text:view(document.body).replace(/[\\t\\f\\v ]+/gu,' ').replace(/ *\\n */gu,'\\n').replace(/\\n{2,}/gu,'\\n').trim(),pairs,controls,images};
       })()`;
       for (const y of positions) {
-        assertCurrentPage();
+        await assertCurrentPage();
         const current = await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:'window.scrollY'})]);
         if(!Number.isFinite(current))throw new Error('当前滚动位置不可读；未将未扫描区域判缺项。');
         const delta = y - current;
         if(delta)await call(['command', browserId, 'scroll', JSON.stringify({tabId,x:0,y:delta})]);
         await new Promise(resolve=>setTimeout(resolve,100));
         const scan=await call(['command',browserId,'evaluate',JSON.stringify({tabId,code:scanCode})]);
-        assertCurrentPage();
+        await assertCurrentPage();
         if(!scan||typeof scan.text!=='string'||!Array.isArray(scan.pairs)||!Array.isArray(scan.controls)||!Array.isArray(scan.images))throw new Error('分屏可见内容读取失败；未将未读取字段判缺项。');
         if(scan.text)textParts.push(scan.text);
         // Prefer rendered row identity over DOM path: a virtualized table can
@@ -507,7 +507,7 @@ async function main() {
         for(const item of scan.controls){const key=`${item.evidenceKey||`${item.label}\u0000${item.groupLabel||''}`}\u0000${item.label}\u0000${item.groupLabel||''}\u0000${JSON.stringify(item.visibleValue)}`;controlsByKey.set(key,item);}
         for(const item of scan.images){const key=`${item.label}\u0000${item.key}`;imagesByKey.set(key,item);}
       }
-      assertCurrentPage();
+      await assertCurrentPage();
       const visibleText=[...new Set(textParts)].join('\n');
       // Do not search arbitrary product copy for “登录后”. Only page identity
       // and standalone access-gate lines can stop a read-only scan.

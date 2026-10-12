@@ -1,6 +1,6 @@
 {
   "name": "shop-listing-missing-fields-free",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "商品后台上架缺项检查 Skill 的本地运行器与离线自测。",
   "scripts": {
